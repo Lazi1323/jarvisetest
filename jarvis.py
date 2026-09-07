@@ -19,6 +19,8 @@ import tempfile
 import sqlite3
 import shlex
 import importlib.util
+import datetime as dt
+import fnmatch
 from io import BytesIO
 from PIL import Image, ImageDraw
 import tkinter as tk
@@ -46,6 +48,10 @@ class Config:
     OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
     OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
     OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+    OPENROUTER_VISION_MODELS = [
+        "dots-studio/dots-3-note-preview:free",
+        "nvidia/llama-nemotron-rerank-vl-1b-v2:free"
+    ]
     MODELS_CACHE_TTL = 3600
 
     TG_BOT = os.getenv("JARVIS_TG_BOT", "")
@@ -55,6 +61,8 @@ class Config:
     ALLOW_SHELL_EXEC = os.getenv("JARVIS_ALLOW_SHELL_EXEC", "0").lower() in {"1", "true", "yes"}
     CONFIRM_ACTIONS = os.getenv("JARVIS_CONFIRM_ACTIONS", "1").lower() in {"1", "true", "yes"}
     ALLOW_SCREEN_UPLOAD = os.getenv("JARVIS_ALLOW_SCREEN_UPLOAD", "1").lower() in {"1", "true", "yes"}
+    AUTO_SCREEN = os.getenv("JARVIS_AUTO_SCREEN", "1").lower() in {"1", "true", "yes"}
+    SCREEN_CACHE_TTL = 3
     ALLOW_UNATTENDED_ACTIONS = os.getenv("JARVIS_ALLOW_UNATTENDED_ACTIONS", "0").lower() in {"1", "true", "yes"}
     MAX_HISTORY_MESSAGES = 40
 
@@ -63,6 +71,7 @@ class Config:
     FILE_MACRO = os.path.join(DIR_CACHE, "macros.json")
     FILE_MEM = os.path.join(DIR_CACHE, "memory.json")
     FILE_MEM_DB = os.path.join(DIR_CACHE, "memory.db")
+    APP_ALIASES = {}
     APPS_INDEX = os.path.join(DIR_CACHE, "apps_index.json")
     MODELS_CACHE = os.path.join(DIR_CACHE, "models_cache.json")
     PLUGIN_DIR = os.path.join(CONFIG_DIR, "plugins")
@@ -95,8 +104,12 @@ class Config:
                         cls.CONFIRM_ACTIONS = bool(cfg["confirm_actions"])
                     if "allow_screen_upload" in cfg and "JARVIS_ALLOW_SCREEN_UPLOAD" not in os.environ:
                         cls.ALLOW_SCREEN_UPLOAD = bool(cfg["allow_screen_upload"])
+                    if "auto_screen" in cfg and "JARVIS_AUTO_SCREEN" not in os.environ:
+                        cls.AUTO_SCREEN = bool(cfg["auto_screen"])
                     if "allow_unattended_actions" in cfg and "JARVIS_ALLOW_UNATTENDED_ACTIONS" not in os.environ:
                         cls.ALLOW_UNATTENDED_ACTIONS = bool(cfg["allow_unattended_actions"])
+                    if isinstance(cfg.get("app_aliases"), dict):
+                        cls.APP_ALIASES = {str(k).lower(): str(v) for k, v in cfg["app_aliases"].items()}
             except Exception as e:
                 LOGGER.error("Ошибка чтения конфига: %s", e)
 
@@ -262,13 +275,18 @@ class MemoryManager:
         conn = sqlite3.connect(Config.FILE_MEM_DB)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS memories ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL UNIQUE, created_at REAL NOT NULL)"
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL UNIQUE, "
+            "category TEXT NOT NULL DEFAULT 'fact', created_at REAL NOT NULL)"
         )
+        try:
+            conn.execute("ALTER TABLE memories ADD COLUMN category TEXT NOT NULL DEFAULT 'fact'")
+        except sqlite3.OperationalError:
+            pass
         if os.path.exists(Config.FILE_MEM) and conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0:
             legacy = cls._load(Config.FILE_MEM, [])
             conn.executemany(
-                "INSERT OR IGNORE INTO memories(text, created_at) VALUES (?, ?)",
-                [(str(item), time.time()) for item in legacy if str(item).strip()]
+                "INSERT OR IGNORE INTO memories(text, category, created_at) VALUES (?, ?, ?)",
+                [(str(item), "fact", time.time()) for item in legacy if str(item).strip()]
             )
             conn.commit()
         return conn
@@ -284,12 +302,12 @@ class MemoryManager:
         return cls._load(Config.FILE_MACRO, {}).get(name.lower())
 
     @classmethod
-    def save_memory(cls, text):
+    def save_memory(cls, text, category="fact"):
         text = text.strip()
         if not text:
             return
         conn = cls._db()
-        conn.execute("INSERT OR IGNORE INTO memories(text, created_at) VALUES (?, ?)", (text, time.time()))
+        conn.execute("INSERT OR IGNORE INTO memories(text, category, created_at) VALUES (?, ?, ?)", (text, category, time.time()))
         conn.execute(
             "DELETE FROM memories WHERE id NOT IN (SELECT id FROM memories ORDER BY id DESC LIMIT 100)"
         )
@@ -311,9 +329,65 @@ class MemoryManager:
     @classmethod
     def get_memory_context(cls):
         conn = cls._db()
-        mem = [row[0] for row in conn.execute("SELECT text FROM memories ORDER BY id DESC LIMIT 40")]
+        mem = [f"[{row[1]}] {row[0]}" for row in conn.execute("SELECT text, category FROM memories ORDER BY id DESC LIMIT 40")]
         conn.close()
         return "\n".join(f"- {m}" for m in mem) if mem else "Пока пусто."
+
+    @classmethod
+    def schedule_task(cls, title, due_at, repeat_seconds=None):
+        conn = cls._db()
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, due_at REAL NOT NULL, repeat_seconds REAL, done INTEGER NOT NULL DEFAULT 0)"
+        )
+        cursor = conn.execute(
+            "INSERT INTO tasks(title, due_at, repeat_seconds) VALUES (?, ?, ?)",
+            (title.strip(), float(due_at), repeat_seconds)
+        )
+        conn.commit()
+        task_id = cursor.lastrowid
+        conn.close()
+        return task_id
+
+    @classmethod
+    def list_tasks(cls, include_done=False):
+        conn = cls._db()
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, due_at REAL NOT NULL, repeat_seconds REAL, done INTEGER NOT NULL DEFAULT 0)"
+        )
+        query = "SELECT id, title, due_at, done FROM tasks " + ("ORDER BY due_at" if include_done else "WHERE done = 0 ORDER BY due_at")
+        rows = conn.execute(query).fetchall()
+        conn.close()
+        return rows
+
+    @classmethod
+    def take_due_tasks(cls, now=None):
+        now = now or time.time()
+        conn = cls._db()
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, due_at REAL NOT NULL, repeat_seconds REAL, done INTEGER NOT NULL DEFAULT 0)"
+        )
+        rows = conn.execute("SELECT id, title, repeat_seconds FROM tasks WHERE done = 0 AND due_at <= ?", (now,)).fetchall()
+        for task_id, _, repeat_seconds in rows:
+            if repeat_seconds:
+                conn.execute("UPDATE tasks SET due_at = ?, done = 0 WHERE id = ?", (now + repeat_seconds, task_id))
+            else:
+                conn.execute("UPDATE tasks SET done = 1 WHERE id = ?", (task_id,))
+        conn.commit()
+        conn.close()
+        return [(task_id, title) for task_id, title, _ in rows]
+
+
+class TaskScheduler(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True, name="jarvis-scheduler")
+        self.stop_event = threading.Event()
+
+    def run(self):
+        while not self.stop_event.wait(5):
+            for _, title in MemoryManager.take_due_tasks():
+                LOGGER.info("Напоминание: %s", title)
+                SystemCore.notify(f"⏰ {title}", 10000)
+                AudioEngine.speak(f"Напоминание. {title}")
 
 # ================= ЛОКАЛЬНЫЕ ИНСТРУМЕНТЫ =================
 class FileSearch:
@@ -326,22 +400,61 @@ class FileSearch:
     SKIP_DIRS = {".cache", ".git", "node_modules", "__pycache__", ".venv", "venv"}
 
     @classmethod
-    def search(cls, query, roots=None, limit=40):
+    def search(cls, query, roots=None, limit=40, mode="auto"):
         query = query.strip()
         if not query:
             return []
+        if query.startswith("--name "):
+            mode, query = "name", query[7:].strip()
+        elif query.startswith("--content "):
+            mode, query = "content", query[10:].strip()
         needle = query.lower()
+        roots = roots or cls.ROOTS
+        if mode in {"auto", "name"} and shutil.which("fd"):
+            pattern = query if any(char in query for char in "*?[") else f"*{query}*"
+            args = ["fd", "--type", "f", "--hidden", "--follow", "--glob", pattern, "--max-results", str(limit)]
+            for skip in cls.SKIP_DIRS:
+                args.extend(["--exclude", skip])
+            args.append("--")
+            args.extend(roots)
+            try:
+                output = subprocess.run(args, capture_output=True, text=True, check=False).stdout
+                name_results = [(line, "имя файла") for line in output.splitlines()[:limit]]
+                if mode == "name" or name_results:
+                    if mode == "name":
+                        return name_results
+                else:
+                    name_results = []
+            except OSError:
+                name_results = []
+        else:
+            name_results = []
+
+        if mode in {"auto", "content"} and shutil.which("rg"):
+            args = ["rg", "--files-with-matches", "--hidden", "--ignore-case", "-m", "1"]
+            for skip in cls.SKIP_DIRS:
+                args.extend(["--glob", f"!{skip}/**"])
+            args.extend(["--", query])
+            args.extend(roots)
+            try:
+                output = subprocess.run(args, capture_output=True, text=True, check=False).stdout
+                content_results = [(line, "содержимое") for line in output.splitlines()[:limit]]
+                if mode == "content" or content_results:
+                    return name_results[:limit] + content_results[:max(0, limit - len(name_results))]
+            except OSError:
+                pass
+
         results = []
-        for root in roots or cls.ROOTS:
+        for root in roots:
             if not os.path.isdir(root):
                 continue
             for current, dirs, files in os.walk(root, topdown=True, onerror=lambda _: None):
                 dirs[:] = [d for d in dirs if d not in cls.SKIP_DIRS and not d.startswith("/proc")]
                 for filename in files:
                     path = os.path.join(current, filename)
-                    if needle in filename.lower():
+                    if mode != "content" and (needle in filename.lower() or fnmatch.fnmatch(filename.lower(), needle)):
                         results.append((path, "имя файла"))
-                    elif len(results) < limit and cls._contains(path, needle):
+                    elif mode != "name" and len(results) < limit and cls._contains(path, needle):
                         results.append((path, "содержимое"))
                     if len(results) >= limit:
                         return results
@@ -417,10 +530,9 @@ class PluginManager:
         items = ", ".join(f"{name} ({item['description']})" for name, item in cls.actions.items())
         return f"Плагины: {items}"
 
-
-    PluginManager.load()
-
 # ================= СИСТЕМНЫЙ СКАНЕР =================
+PluginManager.load()
+
 class SystemScanner:
     ALIASES = {
         "дискорд": ["discord", "vesktop", "webcord"],
@@ -450,7 +562,7 @@ class SystemScanner:
                 continue
             for desktop_path in glob.glob(os.path.join(d, "**/*.desktop"), recursive=True):
                 try:
-                    name, exec_cmd, nodisplay = "", "", False
+                    name, exec_cmd, keywords, nodisplay = "", "", "", False
                     with open(desktop_path, "r", encoding="utf-8", errors="ignore") as f:
                         for line in f:
                             l = line.strip()
@@ -458,15 +570,20 @@ class SystemScanner:
                                 name = l[5:]
                             elif l.startswith("Exec=") and not exec_cmd:
                                 exec_cmd = l[5:]
+                            elif l.startswith("Keywords=") and not keywords:
+                                keywords = l[9:].replace(";", " ")
                             elif l == "NoDisplay=true":
                                 nodisplay = True
                     if nodisplay or not name or not exec_cmd:
                         continue
                     file_id = os.path.basename(desktop_path).replace(".desktop", "").lower()
                     clean_exec = re.sub(r'%[a-zA-Z0-9]', '', exec_cmd).strip()
-                    entry = {"name": name, "exec": clean_exec, "desktop": desktop_path, "id": file_id}
+                    entry = {"name": name, "exec": clean_exec, "desktop": desktop_path, "id": file_id, "keywords": keywords}
                     app_map[name.lower()] = entry
                     app_map[file_id] = entry
+                    for keyword in keywords.lower().split():
+                        if keyword and keyword not in app_map:
+                            app_map[keyword] = entry
                     bin_first = clean_exec.split()[0].split("/")[-1].lower()
                     if bin_first not in app_map:
                         app_map[bin_first] = entry
@@ -479,6 +596,7 @@ class SystemScanner:
     def resolve_app(cls, target):
         index = cls.build_full_index() if not os.path.exists(Config.APPS_INDEX) else MemoryManager._load(Config.APPS_INDEX, {})
         t_clean = target.lower().strip()
+        t_clean = Config.APP_ALIASES.get(t_clean, t_clean)
         expanded = os.path.expanduser(target.strip())
         if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
             return shlex.join([expanded])
@@ -530,6 +648,7 @@ class SystemCore:
     RU_CHARS = "ёйцукенгшщзхъфывапролджэячсмитьбю.ЁЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,"
     T_EN_RU = str.maketrans(EN_CHARS, RU_CHARS)
     T_RU_EN = str.maketrans(RU_CHARS, EN_CHARS)
+    _screen_cache = {"value": None, "timestamp": 0}
 
     @staticmethod
     def get_screen_size():
@@ -631,6 +750,9 @@ class SystemCore:
 
     @staticmethod
     def capture_screen():
+        now = time.time()
+        if SystemCore._screen_cache["value"] and now - SystemCore._screen_cache["timestamp"] < Config.SCREEN_CACHE_TTL:
+            return SystemCore._screen_cache["value"]
         tmp = f"/tmp/j_snap_{uuid.uuid4().hex[:6]}.png"
         cmd = f"grim {tmp} 2>/dev/null || spectacle -b -n -o {tmp} 2>/dev/null || scrot {tmp} 2>/dev/null"
         if subprocess.Popen(cmd, shell=True).wait() == 0 and os.path.exists(tmp):
@@ -640,7 +762,9 @@ class SystemCore:
                     buf = BytesIO()
                     img.save(buf, format="JPEG", quality=75)
                 os.remove(tmp)
-                return base64.b64encode(buf.getvalue()).decode("utf-8")
+                encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+                SystemCore._screen_cache = {"value": encoded, "timestamp": now}
+                return encoded
             except Exception:
                 pass
         return None
@@ -877,6 +1001,7 @@ class AIProvider:
             "MEMORY_SAVE: <сохраняемый факт>\n"
             "SEARCH_FILES: <имя или текст для поиска по файлам>\n"
             "PLUGIN: <ИМЯ> | <аргументы>\n"
+            "Если передано изображение экрана, анализируй только реально видимые элементы и не выдумывай координаты.\n"
         )
 
         clean_history = [m for m in messages[:-1] if isinstance(m.get("content", ""), str) and len(m.get("content", "").strip()) > 1]
@@ -891,7 +1016,15 @@ class AIProvider:
 
         # 1. OpenRouter (Free)
         models = OpenRouterManager.get_models()
-        candidates = (models.get("free_vision", []) if need_vision else models.get("free_text", []))
+        if need_vision:
+            preferred = [{"id": model_id, "vision": True} for model_id in Config.OPENROUTER_VISION_MODELS]
+            preferred_ids = {item["id"] for item in preferred}
+            candidates = preferred + [
+                item for item in models.get("free_vision", [])
+                if isinstance(item, dict) and item.get("id") not in preferred_ids
+            ]
+        else:
+            candidates = models.get("free_text", [])
         for m in candidates[:2]:
             mid = m["id"] if isinstance(m, dict) else m
             supports_vision = isinstance(m, dict) and m.get("vision", False)
@@ -937,7 +1070,7 @@ class AIProvider:
     def process_voice_command(self, text):
         chats = MemoryManager._load(Config.FILE_HIST, [{"title": "Голос", "messages": []}])
         chats[0]["messages"].append({"role": "user", "content": text})
-        needs_vision = any(w in text.lower() for w in ["экран", "окн", "видит", "смотри", "клик", "нажми", "где", "кнопк", "блок"])
+        needs_vision = Config.AUTO_SCREEN or any(w in text.lower() for w in ["экран", "окн", "видит", "смотри", "клик", "нажми", "где", "кнопк", "блок"])
         scr = SystemCore.capture_screen() if needs_vision and Config.ALLOW_SCREEN_UPLOAD else None
         ans, actions = self.ask(chats[0]["messages"], scr, SystemCore.get_active_window_title())
         chats[0]["messages"].append({"role": "assistant", "content": ans})
@@ -1256,6 +1389,8 @@ class JarvisGUI:
                 "/forget <текст> — удалить совпадающие факты\n"
                 "/find <текст> — найти файлы по имени или содержимому\n"
                 "/plugins — показать загруженные плагины\n"
+                "/remind in 20m <текст> — создать напоминание\n"
+                "/tasks — показать активные напоминания\n"
                 "/stop — остановить текущие действия"
             )
         elif command == "/status":
@@ -1268,6 +1403,7 @@ class JarvisGUI:
                 f"Провайдеры: {', '.join(providers) or 'не настроены'}\n"
                 f"Аудио: {'включено' if AUDIO_ENABLED else 'недоступно'}\n"
                 f"Скриншоты: {'разрешены' if Config.ALLOW_SCREEN_UPLOAD else 'запрещены'}\n"
+                f"Авто-vision: {'включён' if Config.AUTO_SCREEN else 'выключен'}\n"
                 f"Shell: {'разрешён' if Config.ALLOW_SHELL_EXEC else 'заблокирован'}"
             )
         elif command == "/clear":
@@ -1285,6 +1421,20 @@ class JarvisGUI:
             return True
         elif command == "/plugins":
             response = PluginManager.prompt_context()
+        elif command == "/remind" and value:
+            task = self._parse_reminder(value)
+            if task:
+                title, due_at = task
+                task_id = MemoryManager.schedule_task(title, due_at)
+                response = f"Напоминание #{task_id} создано: {title}"
+            else:
+                response = "Формат: /remind in 20m текст или /remind at 18:30 текст"
+        elif command == "/tasks":
+            tasks = MemoryManager.list_tasks()
+            response = "\n".join(
+                f"#{task_id} — {title} ({dt.datetime.fromtimestamp(due_at).strftime('%d.%m %H:%M')})"
+                for task_id, title, due_at, _ in tasks
+            ) or "Активных напоминаний нет."
         elif command == "/stop":
             self.stop_actions()
             response = "Остановил выполнение действий."
@@ -1297,6 +1447,23 @@ class JarvisGUI:
         self.upd_ui()
         self.status_var.set("🟢 Онлайн")
         return True
+
+    @staticmethod
+    def _parse_reminder(value):
+        relative = re.match(r"^(?:in|через)\s+(\d+)\s*(s|sec|сек|m|min|мин|минут|минуту|h|hour|ч|час|часа|часов|d|day|д|дн|дней)\s+(.+)$", value, re.IGNORECASE)
+        if relative:
+            amount = int(relative.group(1))
+            unit = relative.group(2).lower()
+            multipliers = {"s": 1, "sec": 1, "сек": 1, "m": 60, "min": 60, "мин": 60, "минут": 60, "минуту": 60, "h": 3600, "hour": 3600, "ч": 3600, "час": 3600, "часа": 3600, "часов": 3600, "d": 86400, "day": 86400, "д": 86400, "дн": 86400, "дней": 86400}
+            return relative.group(3).strip(), time.time() + amount * multipliers[unit]
+        clock = re.match(r"^(?:at|в)\s+(\d{1,2}):(\d{2})\s+(.+)$", value, re.IGNORECASE)
+        if clock:
+            now = dt.datetime.now()
+            due = now.replace(hour=int(clock.group(1)), minute=int(clock.group(2)), second=0, microsecond=0)
+            if due.timestamp() <= time.time():
+                due += dt.timedelta(days=1)
+            return clock.group(3).strip(), due.timestamp()
+        return None
 
     def _find_async(self, query):
         response = FileSearch.format_results(query)
@@ -1336,7 +1503,7 @@ class JarvisGUI:
 
     def _proc(self, c, text):
         try:
-            needs_vis = any(w in text.lower() for w in ["экран", "окн", "видит", "смотри", "клик", "нажми", "где", "кнопк", "блок"])
+            needs_vis = Config.AUTO_SCREEN or any(w in text.lower() for w in ["экран", "окн", "видит", "смотри", "клик", "нажми", "где", "кнопк", "блок"])
             scr = SystemCore.capture_screen() if needs_vis and Config.ALLOW_SCREEN_UPLOAD else None
             meta = SystemCore.get_active_window_title()
 
@@ -1387,16 +1554,31 @@ def create_tray():
         import pystray
         img = Image.new('RGB', (64, 64), color=(17, 17, 27))
         ImageDraw.Draw(img).ellipse((16, 16, 48, 48), fill=(243, 139, 168))
+
+        def open_gui(icon, item):
+            try:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__)])
+            except OSError as exc:
+                LOGGER.error("Не удалось открыть GUI из трея: %s", exc)
+
+        def refresh_models(icon, item):
+            threading.Thread(
+                target=lambda: OpenRouterManager.get_models(force_refresh=True),
+                daemon=True
+            ).start()
+
         m = pystray.Menu(
-            pystray.MenuItem("Открыть", lambda: subprocess.Popen([sys.executable, os.path.abspath(__file__)]), default=True),
-            pystray.MenuItem("Обновить модели", lambda: OpenRouterManager.get_models(force_refresh=True)),
+            pystray.MenuItem("Открыть", open_gui, default=True),
+            pystray.MenuItem("Обновить модели", refresh_models),
             pystray.MenuItem("Выход", lambda i, it: os._exit(0))
         )
         pystray.Icon("J", img, "Jarvis", m).run()
-    except Exception:
-        pass
+    except Exception as exc:
+        LOGGER.exception("Ошибка трей-режима: %s", exc)
 
 if __name__ == "__main__":
+    if not any(flag in sys.argv for flag in ["--fix-layout", "--reindex", "--models"]):
+        TaskScheduler().start()
     if "--fix-layout" in sys.argv:
         SystemCore.fix_layout()
         sys.exit(0)
@@ -1406,6 +1588,7 @@ if __name__ == "__main__":
     elif "--reindex" in sys.argv:
         SystemScanner.build_full_index()
         OpenRouterManager.get_models(force_refresh=True)
+        PluginManager.load()
         print("База приложений и кэш моделей успешно обновлены.")
         sys.exit(0)
     elif "--models" in sys.argv:

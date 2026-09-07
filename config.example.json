@@ -6,5 +6,10 @@
   "allow_shell_exec": false,
   "confirm_actions": true,
   "allow_screen_upload": true,
-  "allow_unattended_actions": false
+  "auto_screen": true,
+  "allow_unattended_actions": false,
+  "app_aliases": {
+    "браузер": "firefox",
+    "редактор": "code"
+  }
 }
