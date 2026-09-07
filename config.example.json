@@ -1,0 +1,10 @@
+{
+  "groq_api_key": "",
+  "openrouter_api_key": "",
+  "tg_bot": "",
+  "tg_chat": "",
+  "allow_shell_exec": false,
+  "confirm_actions": true,
+  "allow_screen_upload": true,
+  "allow_unattended_actions": false
+}

@@ -1,0 +1,7 @@
+requests>=2.31
+Pillow>=10.0
+sounddevice>=0.4
+soundfile>=0.12
+vosk>=0.3
+pystray>=0.19
+edge-tts>=6.1
