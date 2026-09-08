@@ -750,24 +750,65 @@ class SystemCore:
 
     @staticmethod
     def capture_screen():
+        """Сделать скриншот экрана с поддержкой Wayland/X11 и масштабирования."""
         now = time.time()
         if SystemCore._screen_cache["value"] and now - SystemCore._screen_cache["timestamp"] < Config.SCREEN_CACHE_TTL:
             return SystemCore._screen_cache["value"]
+        
         tmp = f"/tmp/j_snap_{uuid.uuid4().hex[:6]}.png"
-        cmd = f"grim {tmp} 2>/dev/null || spectacle -b -n -o {tmp} 2>/dev/null || scrot {tmp} 2>/dev/null"
-        if subprocess.Popen(cmd, shell=True).wait() == 0 and os.path.exists(tmp):
+        encoded = None
+        
+        # Попытка сделать скриншот разными способами
+        cmd_grim = f"grim '{tmp}' 2>/dev/null"
+        cmd_spectacle = f"spectacle -b -n -o '{tmp}' 2>/dev/null"
+        cmd_scrot = f"scrot '{tmp}' 2>/dev/null"
+        cmd_gnome = f"gnome-screenshot -f '{tmp}' 2>/dev/null"
+        cmd_import = f"import -window root '{tmp}' 2>/dev/null"
+        
+        # Определяем приоритет в зависимости от сессии
+        is_wayland = os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        if is_wayland:
+            commands = [cmd_grim, cmd_spectacle, cmd_scrot, cmd_gnome, cmd_import]
+        else:
+            commands = [cmd_spectacle, cmd_scrot, cmd_gnome, cmd_import, cmd_grim]
+        
+        for cmd in commands:
+            try:
+                result = subprocess.run(cmd, shell=True, timeout=5, capture_output=True)
+                if result.returncode == 0 and os.path.exists(tmp):
+                    break
+            except (subprocess.TimeoutExpired, Exception):
+                continue
+        
+        if os.path.exists(tmp):
             try:
                 with Image.open(tmp) as img:
-                    img.thumbnail((1920, 1080))
+                    # Конвертируем в RGB если есть альфа-канал
+                    if img.mode in ('RGBA', 'LA', 'P'):
+                        background = Image.new('RGB', img.size, (0, 0, 0))
+                        if img.mode == 'P':
+                            img = img.convert('RGBA')
+                        background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                        img = background
+                    
+                    # Масштабируем до разумного размера для LLM
+                    img.thumbnail((1920, 1080), Image.Resampling.LANCZOS)
+                    
                     buf = BytesIO()
-                    img.save(buf, format="JPEG", quality=75)
+                    img.save(buf, format="JPEG", quality=80, optimize=True)
+                    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+                
                 os.remove(tmp)
-                encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
                 SystemCore._screen_cache = {"value": encoded, "timestamp": now}
-                return encoded
-            except Exception:
-                pass
-        return None
+                
+            except Exception as e:
+                LOGGER.warning("Ошибка обработки скриншота: %s", e)
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+        else:
+            LOGGER.warning("Не удалось сделать скриншот: ни один инструмент не сработал")
+        
+        return encoded
 
     @classmethod
     def launch(cls, target_cmd, is_silent=True, gui_instance=None):
