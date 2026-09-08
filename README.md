@@ -17,9 +17,11 @@ sudo dnf install -y \
   wl-clipboard xclip \
   grim slurp spectacle scrot \
   tesseract tesseract-langpack-rus \
-  mpv playerctl ripgrep fd-find \
+  mpv playerctl ripgrep \
   libsndfile alsa-utils pulseaudio-utils \
-  flatpak
+  flatpak \
+  gtk3 python3-gobject python3-cairo \
+  libappindicator-gtk3 libayatana-appindicator-gtk3
 ```
 
 Некоторые пакеты могут быть уже установлены. Проверьте команды:
@@ -69,6 +71,15 @@ python -m pip install -r requirements.txt
 python -m pip install edge-tts
 ```
 
+Для рабочего меню трея на KDE Wayland после установки системных GTK-пакетов лучше создать окружение с доступом к системному PyGObject:
+
+```bash
+rm -rf .venv
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
 `edge-tts` нужен для русской озвучки. Проверка:
 
 ```bash
@@ -106,23 +117,11 @@ nano ~/.config/jarvis/config.json
   "allow_shell_exec": false,
   "confirm_actions": true,
   "allow_screen_upload": true,
-  "auto_screen": true,
-  "allow_unattended_actions": false,
-  "app_aliases": {
-    "браузер": "firefox",
-    "редактор": "code"
-  }
+  "allow_unattended_actions": false
 }
 ```
 
 Не вставляйте ключи из переписки или публичных сообщений: опубликованные ключи нужно отозвать и заменить. Файл `~/.config/jarvis/config.json` не добавляйте в Git.
-
-При `allow_screen_upload: true` и `auto_screen: true` Jarvis делает снимок экрана перед запросом и отправляет его в vision-модель OpenRouter. Чтобы использовать vision только по явному запросу или полностью отключить отправку экрана, установите:
-
-```json
-"allow_screen_upload": false,
-"auto_screen": false
-```
 
 Можно указать только один API-провайдер. Без ключей приложение запустится, но ответы модели работать не будут.
 
@@ -289,43 +288,7 @@ X-KDE-autostart-after=panel
 
 Сначала проверьте обычный запуск, затем включайте автозапуск.
 
-## 12. Запуск GUI по `Alt+A` в KDE
-
-GUI — это обычный режим запуска без параметров:
-
-```bash
-python jarvis.py
-```
-
-В KDE Plasma откройте:
-
-```text
-Параметры системы → Клавиатура → Сочетания клавиш → Пользовательские сочетания
-```
-
-Нажмите `Изменить → Создать → Команда или URL` и задайте:
-
-- имя: `J.A.R.V.I.S. GUI`;
-- команда: `/путь/к/проекту/.venv/bin/python /путь/к/проекту/jarvis.py`;
-- сочетание: `Alt+A`.
-
-Нажмите `Применить`, затем проверьте сочетание в любой программе. Оно должно открыть окно Jarvis.
-
-Если хотите запускать трей-режим, укажите вместо обычного запуска:
-
-```text
-/путь/к/проекту/.venv/bin/python /путь/к/проекту/jarvis.py --tray
-```
-
-Перед добавлением сочетания обязательно проверьте команду в Konsole:
-
-```bash
-/путь/к/проекту/.venv/bin/python /путь/к/проекту/jarvis.py
-```
-
-Не используйте `sudo` в команде горячей клавиши. Если `Alt+A` уже занято KDE или другим приложением, удалите старое сочетание либо выберите свободную комбинацию.
-
-## 13. Безопасность
+## 12. Безопасность
 
 По умолчанию команды `SILENT_EXEC` и `TERM_EXEC` отключены:
 
@@ -343,21 +306,13 @@ python jarvis.py
 
 Не включайте одновременно `allow_shell_exec: true` и `allow_unattended_actions: true` постоянно. Модель получает возможность выполнять команды от имени вашего пользователя.
 
-Скриншоты отправляются внешнему AI-провайдеру при `allow_screen_upload: true`. Для режима «vision только по словам экран/окно» используйте:
+Скриншоты отправляются внешнему AI-провайдеру при `allow_screen_upload: true`. Для локального режима:
 
 ```json
-"allow_screen_upload": true,
-"auto_screen": false
+"allow_screen_upload": false
 ```
 
-Для постоянного анализа экрана:
-
-```json
-"allow_screen_upload": true,
-"auto_screen": true
-```
-
-## 14. Приложения и файлы
+## 13. Приложения и файлы
 
 Jarvis умеет открывать:
 
@@ -379,24 +334,11 @@ chmod +x ~/Applications/MyApp.AppImage
 ```text
 /find название
 /find текст внутри файла
-
-/remind in 20m выключить музыку
-/remind at 18:30 проверить почту
-/tasks
 ```
 
 Поиск проверяет имена и содержимое доступных текстовых файлов. Большие и бинарные файлы пропускаются.
 
-Для ускорения используются `fd` для имён и `ripgrep` для содержимого. Можно указать режим явно:
-
-```text
-/find --name *.py
-/find --content API_KEY
-```
-
-Если `fd` или `ripgrep` отсутствуют, Jarvis использует медленный Python fallback.
-
-## 15. Плагины
+## 14. Плагины
 
 Плагины можно положить в `plugins/` проекта или `~/.config/jarvis/plugins`.
 
@@ -419,9 +361,7 @@ def register(api):
 
 Подробнее: [plugins/README.md](plugins/README.md).
 
-В проекте уже есть плагины `TIME_NOW`, `SYSTEM_STATUS`, `MEDIA_PLAY`, `MEDIA_PAUSE`, `MEDIA_NEXT` и `MEDIA_STATUS`.
-
-## 16. Память и файлы данных
+## 15. Память и файлы данных
 
 Память хранится в SQLite и старый `memory.json` автоматически мигрируется при первом запуске.
 
@@ -432,9 +372,7 @@ def register(api):
 - индекс приложений: `~/.cache/jarvis/apps_index.json`;
 - кэш моделей: `~/.cache/jarvis/models_cache.json`.
 
-Напоминания хранятся в той же базе SQLite. Планировщик работает в GUI и tray-режимах.
-
-## 17. Частые ошибки
+## 16. Частые ошибки
 
 ### `ModuleNotFoundError`
 
@@ -499,12 +437,46 @@ python jarvis.py --models
 sudo dnf install -y ripgrep
 ```
 
-## 18. Проверка перед публикацией изменений
+### В трее нет иконки или меню не реагирует
+
+Установите Python-библиотеку и backend для Linux-трея:
+
+```bash
+source .venv/bin/activate
+python -m pip install --upgrade pystray Pillow
+sudo dnf install -y gtk3 python3-gobject python3-cairo libappindicator-gtk3 libayatana-appindicator-gtk3
+```
+
+Если `.venv` создавался без `--system-site-packages`, пересоздайте его после установки `python3-gobject`:
+
+```bash
+deactivate 2>/dev/null || true
+rm -rf .venv
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Проверьте отдельно:
+
+```bash
+python -c "import pystray; print('pystray OK')"
+python jarvis.py --tray
+```
+
+Запускайте `--tray` из Konsole внутри KDE Plasma. Если иконка появляется, но окно не открывается, проверьте:
+
+```bash
+command -v xdotool kdotool
+```
+
+Меню трея содержит `Открыть`, `Показать окно`, `Скрыть окно`, `Обновить модели`, `Остановить действия` и `Выход`. Для повторного открытия GUI можно использовать `Alt+A`.
+
+## 17. Проверка перед публикацией изменений
 
 ```bash
 source .venv/bin/activate
 python -m py_compile jarvis.py plugins/time_plugin.py
 python -m json.tool config.example.json >/dev/null
-python -m unittest discover -s tests -v
 git diff --check
 ```

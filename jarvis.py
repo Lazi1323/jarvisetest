@@ -815,6 +815,7 @@ class AudioEngine(threading.Thread):
         self.mp = os.path.expanduser("~/.cache/vosk-model-ru")
         self.silence_threshold = 300
         self.silence_duration = 0.8
+        self.listening = False
 
     def _audio_cb(self, indata, frames, time_info, status):
         self.q.put(bytes(indata))
@@ -860,77 +861,99 @@ class AudioEngine(threading.Thread):
 
     def run(self):
         if not AUDIO_ENABLED or not os.path.exists(self.mp):
+            LOGGER.warning("Голосовой режим отключён: нет аудиозависимостей или модели Vosk (%s)", self.mp)
             return
         try:
             model = Model(self.mp)
             rec = KaldiRecognizer(model, 16000)
         except Exception as e:
-            print(f"[AudioEngine] Ошибка инициализации Vosk: {e}")
+            LOGGER.exception("Ошибка инициализации Vosk: %s", e)
             return
 
         while True:
             try:
                 with sd.RawInputStream(samplerate=16000, blocksize=4000, dtype='int16', channels=1, callback=self._audio_cb):
+                    self.listening = True
                     while True:
-                        data_chunk = self.q.get()
+                        try:
+                            data_chunk = self.q.get(timeout=2)
+                        except queue.Empty:
+                            continue
                         if rec.AcceptWaveform(data_chunk):
                             res = json.loads(rec.Result())
                             if "джарвис" in res.get("text", "").lower():
-                                SystemCore.media_duck(True)
-                                SystemCore.notify("🎙️ Слушаю...", 2000)
-                                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/message.oga"], stderr=subprocess.DEVNULL)
-                                with self.q.mutex:
-                                    self.q.queue.clear()
-                                data = bytearray()
-                                silence_frames = 0
-                                frames_needed = int(16000 * self.silence_duration / 4000)
-
-                                while True:
-                                    chunk = self.q.get()
-                                    data.extend(chunk)
-                                    if self._get_rms(chunk) < self.silence_threshold:
-                                        silence_frames += 1
-                                    else:
-                                        silence_frames = 0
-                                    if silence_frames >= frames_needed and len(data) > 16000 * 2 * 0.5:
-                                        break
-                                    elif len(data) > 16000 * 2 * 10:
-                                        break
-
-                                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/complete.oga"], stderr=subprocess.DEVNULL)
-                                SystemCore.notify("⏳ Думаю...", 2000)
-                                rp = "/tmp/j_cmd.wav"
-                                with wave.open(rp, "wb") as wf:
-                                    wf.setnchannels(1)
-                                    wf.setsampwidth(2)
-                                    wf.setframerate(16000)
-                                    wf.writeframes(data)
-
-                                txt = ""
-                                if Config.GROQ_API_KEY:
-                                    try:
-                                        with open(rp, "rb") as af:
-                                            r = requests.post(
-                                                "https://api.groq.com/openai/v1/audio/transcriptions",
-                                                headers={"Authorization": f"Bearer {Config.GROQ_API_KEY}"},
-                                                files={"file": (rp, af, "audio/wav")},
-                                                data={"model": "whisper-large-v3", "language": "ru"},
-                                                timeout=10
-                                            )
-                                            if r.status_code == 200:
-                                                txt = r.json().get("text", "").strip()
-                                    except Exception:
-                                        pass
-
-                                if txt:
-                                    txt = re.sub(r'^[мМэЭаА][,\s]+', '', txt).strip()
-                                    SystemCore.notify(f"🧠 {txt}", 4000)
-                                    self.ai.process_voice_command(txt)
-                                else:
-                                    SystemCore.notify("❌ Не распознано", 2000)
-                                SystemCore.media_duck(False)
-            except Exception:
+                                self._handle_wake_word()
+            except Exception as exc:
+                self.listening = False
+                SystemCore.media_duck(False)
+                LOGGER.exception("Аудиопоток перезапущен после ошибки: %s", exc)
                 time.sleep(3)
+
+    def _handle_wake_word(self):
+        SystemCore.media_duck(True)
+        try:
+            SystemCore.notify("🎙️ Слушаю...", 2000)
+            subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/message.oga"], stderr=subprocess.DEVNULL)
+            with self.q.mutex:
+                self.q.queue.clear()
+            data = bytearray()
+            silence_frames = 0
+            frames_needed = int(16000 * self.silence_duration / 4000)
+            started = time.monotonic()
+            while time.monotonic() - started < 12:
+                try:
+                    chunk = self.q.get(timeout=1)
+                except queue.Empty:
+                    continue
+                data.extend(chunk)
+                if self._get_rms(chunk) < self.silence_threshold:
+                    silence_frames += 1
+                else:
+                    silence_frames = 0
+                if silence_frames >= frames_needed and len(data) > 16000 * 2 * 0.5:
+                    break
+
+            if len(data) < 16000 * 2 * 0.5:
+                SystemCore.notify("❌ Не услышал команду", 2000)
+                return
+
+            subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/complete.oga"], stderr=subprocess.DEVNULL)
+            SystemCore.notify("⏳ Думаю...", 2000)
+            rp = os.path.join(tempfile.gettempdir(), f"jarvis-command-{uuid.uuid4().hex}.wav")
+            try:
+                with wave.open(rp, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes(data)
+                txt = ""
+                if Config.GROQ_API_KEY:
+                    with open(rp, "rb") as af:
+                        response = requests.post(
+                            "https://api.groq.com/openai/v1/audio/transcriptions",
+                            headers={"Authorization": f"Bearer {Config.GROQ_API_KEY}"},
+                            files={"file": (rp, af, "audio/wav")},
+                            data={"model": "whisper-large-v3", "language": "ru"},
+                            timeout=10
+                        )
+                    if response.status_code == 200:
+                        txt = response.json().get("text", "").strip()
+                if txt:
+                    txt = re.sub(r'^[мМэЭаА][,\s]+', '', txt).strip()
+                    SystemCore.notify(f"🧠 {txt}", 4000)
+                    self.ai.process_voice_command(txt)
+                else:
+                    SystemCore.notify("❌ Не распознано или не настроен GROQ_API_KEY", 2500)
+            finally:
+                try:
+                    os.remove(rp)
+                except FileNotFoundError:
+                    pass
+        except Exception as exc:
+            LOGGER.exception("Ошибка обработки голосовой команды: %s", exc)
+            SystemCore.notify("❌ Ошибка голосовой команды. Слушатель продолжит работу.", 3000)
+        finally:
+            SystemCore.media_duck(False)
 
 # ================= ИИ ПРОВАЙДЕР =================
 class AIProvider:
@@ -1549,30 +1572,95 @@ class JarvisGUI:
             ).start()
 
 # ================= ТОЧКА ВХОДА =================
+TRAY_GUI_PROCESS = None
+
+
+def _find_jarvis_window(action):
+    commands = []
+    if shutil.which("kdotool"):
+        commands.append(["kdotool", "search", "--name", "J.A.R.V.I.S.", action])
+    if shutil.which("xdotool"):
+        commands.append(["xdotool", "search", "--name", "J.A.R.V.I.S.", action])
+    for command in commands:
+        try:
+            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if result.returncode == 0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def create_tray():
+    global TRAY_GUI_PROCESS
     try:
+        if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+            os.environ.setdefault("PYSTRAY_BACKEND", "appindicator")
+        else:
+            os.environ.setdefault("PYSTRAY_BACKEND", "xorg")
         import pystray
         img = Image.new('RGB', (64, 64), color=(17, 17, 27))
         ImageDraw.Draw(img).ellipse((16, 16, 48, 48), fill=(243, 139, 168))
 
         def open_gui(icon, item):
+            global TRAY_GUI_PROCESS
             try:
-                subprocess.Popen([sys.executable, os.path.abspath(__file__)])
+                if _find_jarvis_window("windowactivate"):
+                    _find_jarvis_window("windowraise")
+                    return
+                if TRAY_GUI_PROCESS and TRAY_GUI_PROCESS.poll() is None:
+                    return
+                TRAY_GUI_PROCESS = subprocess.Popen(
+                    [sys.executable, os.path.abspath(__file__)],
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    env=SystemCore.get_env()
+                )
             except OSError as exc:
                 LOGGER.error("Не удалось открыть GUI из трея: %s", exc)
 
+        def show_gui(icon, item):
+            open_gui(icon, item)
+
+        def hide_gui(icon, item):
+            if not _find_jarvis_window("windowminimize"):
+                LOGGER.info("Окно Jarvis не найдено для сворачивания")
+
         def refresh_models(icon, item):
             threading.Thread(
-                target=lambda: OpenRouterManager.get_models(force_refresh=True),
+                target=lambda: (
+                    OpenRouterManager.get_models(force_refresh=True),
+                    SystemCore.notify("Модели обновлены", 2000)
+                ),
                 daemon=True
             ).start()
 
+        def stop_actions(icon, item):
+            ActionExecutor.stop()
+            SystemCore.notify("Выполнение действий остановлено", 2500)
+
+        def quit_tray(icon, item):
+            global TRAY_GUI_PROCESS
+            if TRAY_GUI_PROCESS and TRAY_GUI_PROCESS.poll() is None:
+                TRAY_GUI_PROCESS.terminate()
+            icon.stop()
+
         m = pystray.Menu(
             pystray.MenuItem("Открыть", open_gui, default=True),
+            pystray.MenuItem("Показать окно", show_gui),
+            pystray.MenuItem("Скрыть окно", hide_gui),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Обновить модели", refresh_models),
-            pystray.MenuItem("Выход", lambda i, it: os._exit(0))
+            pystray.MenuItem("Остановить действия", stop_actions),
+            pystray.MenuItem("Выход", quit_tray)
         )
-        pystray.Icon("J", img, "Jarvis", m).run()
+        pystray.Icon("J", img, "Jarvis", menu=m).run()
+    except ImportError:
+        LOGGER.error("Трей недоступен: установите pystray и GTK/AppIndicator backend; запускаю GUI вместо трея")
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__)],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            env=SystemCore.get_env()
+        )
     except Exception as exc:
         LOGGER.exception("Ошибка трей-режима: %s", exc)
 
